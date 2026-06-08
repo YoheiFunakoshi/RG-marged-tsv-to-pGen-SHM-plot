@@ -128,7 +128,7 @@ class App(tk.Tk):
 
     def check_setup(self):
         self.clear_log()
-        packages = ["numpy", "matplotlib", "scipy", "olga"]
+        packages = ["numpy", "matplotlib", "scipy", "olga", "openpyxl"]
         ok = True
         for package in packages:
             try:

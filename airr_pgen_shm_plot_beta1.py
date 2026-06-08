@@ -29,6 +29,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
+try:
+    from openpyxl import Workbook
+except Exception:  # pragma: no cover - handled by check_setup / runtime error
+    Workbook = None
+
 
 PGEN_EDGES = [1e-5, 1e-10, 1e-15, 1e-20, 1e-25, 1e-30, 1e-35, 1e-40]
 PGEN_LABELS = [
@@ -53,6 +58,21 @@ SHM_LABELS = [
     "16~18%",
     "18~20%",
     "20~%",
+]
+ROW_LEVEL_COLUMNS = [
+    "sequence_id",
+    "junction_aa",
+    "shm",
+    "pgen",
+    "log10_pgen",
+    "junction",
+    "v_identity",
+    "locus",
+    "productive",
+    "v_call",
+    "j_call",
+    "same_xy_count",
+    "plot_weight",
 ]
 AA_ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 TRUTHY = {"T", "TRUE", "1", "Y", "YES"}
@@ -173,7 +193,7 @@ def open_airr_tsv(path: Path) -> Iterable[dict[str, str]]:
             if len(tsv_names) > 1:
                 raise ValueError("ZIP contains multiple TSV/TXT files. Please unzip and choose one.")
             with zf.open(tsv_names[0], "r") as fb:
-                text = io.TextIOWrapper(fb, encoding="utf-8", errors="replace", newline="")
+                text = io.TextIOWrapper(fb, encoding="utf-8-sig", errors="replace", newline="")
                 reader = csv.DictReader(text, delimiter="\t")
                 if reader.fieldnames is None:
                     raise ValueError("Input TSV has no header.")
@@ -181,7 +201,7 @@ def open_airr_tsv(path: Path) -> Iterable[dict[str, str]]:
                     yield row
         return
 
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         if reader.fieldnames is None:
             raise ValueError("Input TSV has no header.")
@@ -196,9 +216,9 @@ def get_fieldnames(path: Path) -> list[str]:
             if len(tsv_names) != 1:
                 raise ValueError("ZIP must contain exactly one TSV/TXT file.")
             with zf.open(tsv_names[0], "r") as fb:
-                header = fb.readline().decode("utf-8", errors="replace").rstrip("\n\r")
+                header = fb.readline().decode("utf-8-sig", errors="replace").rstrip("\n\r")
         return header.split("\t")
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         return handle.readline().rstrip("\n\r").split("\t")
 
 
@@ -217,7 +237,7 @@ def load_pgen_cache(cache_path: Path) -> dict[str, float]:
     cache: dict[str, float] = {}
     if not cache_path.exists():
         return cache
-    with cache_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+    with cache_path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
             aa = (row.get("junction_aa") or row.get("AA_JUNCTION") or "").strip().upper()
@@ -299,6 +319,7 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
     j_to_read_count = Counter()
     j_to_weighted_read_count = Counter()
     j_to_vlen: dict[str, list[int]] = defaultdict(list)
+    row_records: list[dict[str, object]] = []
 
     for row in open_airr_tsv(config.input_path):
         stats["rows_total"] += 1
@@ -349,6 +370,11 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
         if config.use_duplicate_count and has_dup:
             weight = max(1, to_int(row.get("duplicate_count"), default=1))
 
+        sequence_id = (row.get("sequence_id") or "").strip()
+        if not sequence_id:
+            sequence_id = f"row_{stats['rows_total']}"
+            stats["missing_sequence_id_replaced"] += 1
+
         aa_counts[aa] += weight
         j_to_shm[junction].append(shm)
         j_to_aa[junction][aa] += 1
@@ -357,6 +383,23 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
         if vlen:
             j_to_vlen[junction].append(vlen)
         stats["kept_weighted_reads"] += weight
+        row_records.append(
+            {
+                "sequence_id": sequence_id,
+                "junction_aa": aa,
+                "shm": shm,
+                "pgen": 0.0,
+                "log10_pgen": math.nan,
+                "junction": junction,
+                "v_identity": v_identity,
+                "locus": locus,
+                "productive": (row.get("productive") or "").strip(),
+                "v_call": (row.get("v_call") or "").strip(),
+                "j_call": (row.get("j_call") or "").strip(),
+                "same_xy_count": 0,
+                "plot_weight": weight,
+            }
+        )
 
     stats["kept_reads"] = sum(j_to_read_count.values())
     stats["kept_unique_junction_nt"] = len(j_to_read_count)
@@ -372,7 +415,7 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
     log(f"Rows kept after beta_1 filtering: {stats['kept_reads']:,}")
     log(f"Unique junction(nt) points: {stats['kept_unique_junction_nt']:,}")
     log(f"Unique junction_aa for pGen: {stats['kept_unique_junction_aa']:,}")
-    return aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, stats
+    return aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, row_records, stats
 
 
 def write_qc_summary(stats: Counter, out_tsv: Path) -> None:
@@ -491,11 +534,99 @@ def write_points(
     return rows
 
 
-def write_shm_hist(points: list[dict[str, object]], out_tsv: Path, weight_key: str | None = None) -> list[float]:
+def add_pgen_to_row_records(row_records: list[dict[str, object]], aa_to_pgen: dict[str, float]) -> None:
+    xy_counts = Counter()
+    for row in row_records:
+        aa = str(row["junction_aa"])
+        pgen = float(aa_to_pgen.get(aa, 0.0))
+        log10_pgen = math.log10(pgen) if pgen > 0 else math.nan
+        row["pgen"] = pgen
+        row["log10_pgen"] = log10_pgen
+        if pgen > 0 and not math.isnan(log10_pgen):
+            xy_counts[(log10_pgen, float(row["shm"]))] += 1
+
+    for row in row_records:
+        log10_pgen = float(row["log10_pgen"])
+        if float(row["pgen"]) > 0 and not math.isnan(log10_pgen):
+            row["same_xy_count"] = int(xy_counts[(log10_pgen, float(row["shm"]))])
+        else:
+            row["same_xy_count"] = 0
+
+
+def clean_excel_value(value: object) -> object:
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def write_row_level_excel(row_records: list[dict[str, object]], out_xlsx: Path) -> None:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required to write Excel output. Install it with: pip install openpyxl")
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("accepted_rows")
+    ws.append(ROW_LEVEL_COLUMNS)
+    for row in row_records:
+        ws.append([clean_excel_value(row.get(column, "")) for column in ROW_LEVEL_COLUMNS])
+    wb.save(out_xlsx)
+
+
+def write_row_level_tsv(row_records: list[dict[str, object]], out_tsv: Path) -> None:
+    with out_tsv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(ROW_LEVEL_COLUMNS)
+        for row in row_records:
+            values = []
+            for column in ROW_LEVEL_COLUMNS:
+                value = clean_excel_value(row.get(column, ""))
+                if value is None:
+                    value = ""
+                values.append(value)
+            writer.writerow(values)
+
+
+def compact_xy_points(
+    rows: list[dict[str, object]],
+    config: AnalysisConfig,
+    weight_key: str | None = None,
+) -> list[dict[str, float]]:
+    compacted: dict[tuple[float, float], dict[str, float]] = {}
+    for row in rows:
+        pgen = float(row["pgen"])
+        log10_pgen = float(row["log10_pgen"])
+        shm = float(row["shm"])
+        if (
+            pgen <= 0
+            or math.isnan(log10_pgen)
+            or not (config.xlim[0] <= log10_pgen <= config.xlim[1])
+            or not (config.ylim[0] <= shm <= config.ylim[1])
+        ):
+            continue
+        key = (log10_pgen, shm)
+        if key not in compacted:
+            compacted[key] = {
+                "log10_pgen": log10_pgen,
+                "shm": shm,
+                "same_xy_count": 0.0,
+                "plot_weight": 0.0,
+            }
+        compacted[key]["same_xy_count"] += 1.0
+        if weight_key:
+            compacted[key]["plot_weight"] += max(0.0, float(row.get(weight_key, 1.0)))
+        else:
+            compacted[key]["plot_weight"] += 1.0
+    return list(compacted.values())
+
+
+def write_shm_hist(
+    points: list[dict[str, object]],
+    out_tsv: Path,
+    weight_key: str | None = None,
+    shm_key: str = "shm_median",
+) -> list[float]:
     counts = Counter()
     for row in points:
         weight = float(row.get(weight_key, 1.0)) if weight_key else 1.0
-        counts[shm_bin_label(float(row["shm_median"]))] += weight
+        counts[shm_bin_label(float(row[shm_key]))] += weight
     total = sum(counts.values()) or 1
     fractions = [counts.get(label, 0) / total for label in SHM_LABELS]
     with out_tsv.open("w", encoding="utf-8", newline="") as handle:
@@ -612,6 +743,89 @@ def plot_weighted_scatter(points: list[dict[str, object]], config: AnalysisConfi
     return len(filtered)
 
 
+def plot_xy_kde(
+    xy_points: list[dict[str, float]],
+    config: AnalysisConfig,
+    out_png: Path,
+    log: LogFn,
+    title_suffix: str,
+) -> int:
+    if len(xy_points) < 5:
+        log("Too few valid row-level points for KDE; writing scatter fallback instead.")
+        plot_xy_scatter(xy_points, config, out_png, title_suffix)
+        return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
+
+    xs = np.array([float(point["log10_pgen"]) for point in xy_points], dtype=float)
+    ys = np.array([float(point["shm"]) for point in xy_points], dtype=float)
+    weights = np.array([max(0.0, float(point.get("plot_weight", 1.0))) for point in xy_points], dtype=float)
+    if weights.sum() <= 0:
+        weights = None
+    try:
+        kde_args = {
+            "bw_method": lambda obj: obj.scotts_factor() * config.bw_factor,
+        }
+        if weights is not None:
+            kde_args["weights"] = weights
+        kde = gaussian_kde(np.vstack([xs, ys]), **kde_args)
+        xi = np.linspace(config.xlim[0], config.xlim[1], 250)
+        yi = np.linspace(config.ylim[0], config.ylim[1], 250)
+        x_grid, y_grid = np.meshgrid(xi, yi)
+        density = kde(np.vstack([x_grid.ravel(), y_grid.ravel()])).reshape(x_grid.shape)
+    except TypeError as exc:
+        log(f"Weighted KDE is not supported by this SciPy ({exc}); writing scatter fallback instead.")
+        plot_xy_scatter(xy_points, config, out_png, title_suffix)
+        return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
+    except Exception as exc:
+        log(f"KDE failed ({exc}); writing scatter fallback instead.")
+        plot_xy_scatter(xy_points, config, out_png, title_suffix)
+        return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
+
+    plt.figure(figsize=(6.2, 6.0))
+    plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
+    plt.xlabel("pGen (log10)")
+    plt.ylabel("%Mutation")
+    plt.title(f"{config.sample} pGen-SHM {title_suffix}")
+    plt.xlim(config.xlim)
+    plt.ylim(config.ylim)
+    plt.grid(True, alpha=0.35)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+    return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
+
+
+def plot_xy_scatter(
+    xy_points: list[dict[str, float]],
+    config: AnalysisConfig,
+    out_png: Path,
+    title_suffix: str,
+) -> int:
+    xs = np.array([float(point["log10_pgen"]) for point in xy_points], dtype=float)
+    ys = np.array([float(point["shm"]) for point in xy_points], dtype=float)
+    weights = np.array([max(1.0, float(point.get("plot_weight", 1.0))) for point in xy_points], dtype=float)
+    if len(xy_points) == 0:
+        sizes = np.array([], dtype=float)
+    else:
+        log_weights = np.log10(weights + 1.0)
+        if float(log_weights.max()) > float(log_weights.min()):
+            sizes = 10.0 + 75.0 * (log_weights - log_weights.min()) / (log_weights.max() - log_weights.min())
+        else:
+            sizes = np.full_like(log_weights, 24.0)
+
+    plt.figure(figsize=(6.2, 6.0))
+    plt.scatter(xs, ys, s=sizes, alpha=0.35, color="#2b7fb8", edgecolors="none")
+    plt.xlabel("pGen (log10)")
+    plt.ylabel("%Mutation")
+    plt.title(f"{config.sample} pGen-SHM {title_suffix}")
+    plt.xlim(config.xlim)
+    plt.ylim(config.ylim)
+    plt.grid(True, alpha=0.35)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+    return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
+
+
 def plot_scatter(points: list[dict[str, object]], config: AnalysisConfig, out_png: Path) -> None:
     xs = [float(row["log10_pgen"]) for row in points if float(row["pgen"]) > 0]
     ys = [float(row["shm_median"]) for row in points if float(row["pgen"]) > 0]
@@ -646,9 +860,11 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
         "shm_hist_png": config.output_dir / f"{prefix}_shm_hist.png",
         "shm_hist_weighted": config.output_dir / f"{prefix}_shm_hist_weighted.tsv",
         "shm_hist_weighted_png": config.output_dir / f"{prefix}_shm_hist_weighted.png",
+        "rows_xlsx": config.output_dir / f"{prefix}_pgen_shm_rows.xlsx",
         "points": config.output_dir / f"{prefix}_pgen_shm_points.tsv",
         "kde_png": config.output_dir / f"{prefix}_pgen_shm_kde_unweighted.png",
         "kde_weighted_png": config.output_dir / f"{prefix}_pgen_shm_kde_weighted.png",
+        "scatter_reads_png": config.output_dir / f"{prefix}_pgen_shm_scatter_reads.png",
         "scatter_weighted_png": config.output_dir / f"{prefix}_pgen_shm_scatter_weighted.png",
         "run_log": config.output_dir / f"{prefix}_run_log.txt",
     }
@@ -664,13 +880,16 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"pGen cache: {config.cache_path}")
     log_both(f"Locus policy: keep {config.locus}; empty locus is kept with a QC count.")
 
-    aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, stats = read_and_aggregate(config, log_both)
+    aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, row_records, stats = read_and_aggregate(
+        config,
+        log_both,
+    )
     write_qc_summary(stats, outputs["qc_summary"])
     log_both(f"Saved QC summary: {outputs['qc_summary']}")
 
-    aa_for_points = [counter.most_common(1)[0][0] for counter in j_to_aa.values() if counter]
-    aa_all = sorted(set(aa_counts.keys()) | set(aa_for_points))
+    aa_all = sorted(aa_counts.keys())
     aa_to_pgen = compute_pgen_for_aas(aa_all, config.cache_path, log_both)
+    add_pgen_to_row_records(row_records, aa_to_pgen)
 
     frac_unique, frac_weighted = write_pgen_bins(aa_counts, aa_to_pgen, outputs["pgen_bins"])
     plot_barh(PGEN_LABELS, frac_unique, "pGen", "Frequency", f"{config.sample} pGen bins (unique AA)", outputs["pgen_bins_unique_png"])
@@ -678,25 +897,21 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Saved pGen bins: {outputs['pgen_bins']}")
     log_both(f"Saved pGen plots: {outputs['pgen_bins_unique_png']} ; {outputs['pgen_bins_weighted_png']}")
 
-    points = write_points(
-        sorted(j_to_read_count.keys()),
-        j_to_shm,
-        j_to_aa,
-        j_to_read_count,
-        j_to_weighted_read_count,
-        j_to_vlen,
-        aa_to_pgen,
-        outputs["points"],
-    )
-    zero_points = sum(1 for row in points if float(row["pgen"]) <= 0)
-    log_both(f"Saved pGen-SHM points: {outputs['points']}")
-    log_both(f"pGen=0 points retained in points TSV and excluded from KDE: {zero_points:,}")
+    write_row_level_excel(row_records, outputs["rows_xlsx"])
+    write_row_level_tsv(row_records, outputs["points"])
+    zero_points = sum(1 for row in row_records if float(row["pgen"]) <= 0)
+    duplicate_xy_rows = sum(1 for row in row_records if int(row.get("same_xy_count", 0)) > 1)
+    unique_xy_points = len({(float(row["log10_pgen"]), float(row["shm"])) for row in row_records if float(row["pgen"]) > 0})
+    log_both(f"Saved row-level pGen-SHM Excel: {outputs['rows_xlsx']}")
+    log_both(f"Saved row-level pGen-SHM points TSV: {outputs['points']}")
+    log_both(f"pGen=0 rows retained in Excel/points TSV and excluded from plots: {zero_points:,}")
+    log_both(f"Row-level plot rows: {len(row_records):,}; unique plotted x-y coordinates: {unique_xy_points:,}; rows sharing an x-y coordinate: {duplicate_xy_rows:,}")
 
-    shm_frac = write_shm_hist(points, outputs["shm_hist"])
+    shm_frac = write_shm_hist(row_records, outputs["shm_hist"], shm_key="shm")
     plot_barh(SHM_LABELS, shm_frac, "%Mutation", "Frequency", f"{config.sample} SHM histogram", outputs["shm_hist_png"])
     log_both(f"Saved SHM histogram: {outputs['shm_hist']} ; {outputs['shm_hist_png']}")
 
-    shm_weighted_frac = write_shm_hist(points, outputs["shm_hist_weighted"], weight_key="weighted_read_count")
+    shm_weighted_frac = write_shm_hist(row_records, outputs["shm_hist_weighted"], weight_key="plot_weight", shm_key="shm")
     plot_barh(
         SHM_LABELS,
         shm_weighted_frac,
@@ -707,17 +922,23 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     )
     log_both(f"Saved weighted SHM histogram: {outputs['shm_hist_weighted']} ; {outputs['shm_hist_weighted_png']}")
 
-    kde_points = plot_kde(points, config, outputs["kde_png"], log_both)
-    log_both(f"Saved pGen-SHM KDE plot: {outputs['kde_png']}")
-    log_both(f"KDE plotted points: {kde_points:,}")
+    xy_points = compact_xy_points(row_records, config)
+    weighted_xy_points = compact_xy_points(row_records, config, weight_key="plot_weight")
+    scatter_points = plot_xy_scatter(xy_points, config, outputs["scatter_reads_png"], "row-level scatter")
+    log_both(f"Saved row-level pGen-SHM scatter plot: {outputs['scatter_reads_png']}")
+    log_both(f"Row-level scatter plotted rows: {scatter_points:,}; plotted x-y coordinates: {len(xy_points):,}")
 
-    weighted_kde_points = plot_kde(points, config, outputs["kde_weighted_png"], log_both, weight_key="weighted_read_count")
-    log_both(f"Saved weighted pGen-SHM KDE plot: {outputs['kde_weighted_png']}")
-    log_both(f"Weighted KDE plotted points: {weighted_kde_points:,}")
+    kde_points = plot_xy_kde(xy_points, config, outputs["kde_png"], log_both, "row-level KDE")
+    log_both(f"Saved row-level pGen-SHM KDE plot: {outputs['kde_png']}")
+    log_both(f"Row-level KDE plotted rows: {kde_points:,}")
 
-    scatter_points = plot_weighted_scatter(points, config, outputs["scatter_weighted_png"])
+    weighted_kde_points = plot_xy_kde(weighted_xy_points, config, outputs["kde_weighted_png"], log_both, "row-level weighted KDE")
+    log_both(f"Saved row-level weighted pGen-SHM KDE plot: {outputs['kde_weighted_png']}")
+    log_both(f"Row-level weighted KDE plotted weight: {weighted_kde_points:,}")
+
+    scatter_points = plot_xy_scatter(weighted_xy_points, config, outputs["scatter_weighted_png"], "row-level weighted scatter")
     log_both(f"Saved weighted pGen-SHM scatter plot: {outputs['scatter_weighted_png']}")
-    log_both(f"Weighted scatter plotted points: {scatter_points:,}")
+    log_both(f"Weighted scatter plotted weight: {scatter_points:,}; plotted x-y coordinates: {len(weighted_xy_points):,}")
 
     write_run_log(run_log_lines, outputs["run_log"])
     log(f"Saved run log: {outputs['run_log']}")
