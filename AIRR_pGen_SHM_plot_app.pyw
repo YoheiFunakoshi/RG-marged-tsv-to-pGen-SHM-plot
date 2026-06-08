@@ -30,6 +30,8 @@ class App(tk.Tk):
         self.sample_var = tk.StringVar()
         self.cache_var = tk.StringVar()
         self.use_dup_var = tk.BooleanVar(value=False)
+        self.recalc_pgen_var = tk.BooleanVar(value=True)
+        self.pgen_workers_var = tk.StringVar(value="4")
         self.vlen_var = tk.StringVar(value="0")
         self.xlim_var = tk.StringVar(value="-30,-5")
         self.ylim_var = tk.StringVar(value="0,15")
@@ -69,14 +71,19 @@ class App(tk.Tk):
         tk.Checkbutton(opts, text="Use duplicate_count for weighted outputs if present", variable=self.use_dup_var).grid(
             row=0, column=0, columnspan=4, sticky="w"
         )
-        tk.Label(opts, text="Min V alignment length").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        tk.Entry(opts, textvariable=self.vlen_var, width=12).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        tk.Label(opts, text="KDE xlim").grid(row=1, column=2, sticky="e", padx=(18, 4), pady=(6, 0))
-        tk.Entry(opts, textvariable=self.xlim_var, width=14).grid(row=1, column=3, sticky="w", pady=(6, 0))
-        tk.Label(opts, text="KDE ylim").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        tk.Entry(opts, textvariable=self.ylim_var, width=12).grid(row=2, column=1, sticky="w", pady=(6, 0))
-        tk.Label(opts, text="Bandwidth").grid(row=2, column=2, sticky="e", padx=(18, 4), pady=(6, 0))
-        tk.Entry(opts, textvariable=self.bw_var, width=14).grid(row=2, column=3, sticky="w", pady=(6, 0))
+        tk.Checkbutton(opts, text="Recalculate all pGen (ignore existing cache)", variable=self.recalc_pgen_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        tk.Label(opts, text="pGen workers").grid(row=1, column=2, sticky="e", padx=(18, 4), pady=(6, 0))
+        tk.Entry(opts, textvariable=self.pgen_workers_var, width=14).grid(row=1, column=3, sticky="w", pady=(6, 0))
+        tk.Label(opts, text="Min V alignment length").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        tk.Entry(opts, textvariable=self.vlen_var, width=12).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        tk.Label(opts, text="KDE xlim").grid(row=2, column=2, sticky="e", padx=(18, 4), pady=(6, 0))
+        tk.Entry(opts, textvariable=self.xlim_var, width=14).grid(row=2, column=3, sticky="w", pady=(6, 0))
+        tk.Label(opts, text="KDE ylim").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        tk.Entry(opts, textvariable=self.ylim_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
+        tk.Label(opts, text="Bandwidth").grid(row=3, column=2, sticky="e", padx=(18, 4), pady=(6, 0))
+        tk.Entry(opts, textvariable=self.bw_var, width=14).grid(row=3, column=3, sticky="w", pady=(6, 0))
 
         actions = tk.Frame(root)
         actions.grid(row=row + 2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
@@ -167,6 +174,12 @@ class App(tk.Tk):
             min_vlen = int(self.vlen_var.get().strip() or "0")
         except ValueError as exc:
             raise ValueError("Min V alignment length must be an integer.") from exc
+        try:
+            pgen_workers = int(self.pgen_workers_var.get().strip() or "4")
+        except ValueError as exc:
+            raise ValueError("pGen workers must be an integer.") from exc
+        if pgen_workers < 1:
+            raise ValueError("pGen workers must be >= 1.")
         xlim = parse_pair(self.xlim_var.get().strip(), "KDE xlim")
         ylim = parse_pair(self.ylim_var.get().strip(), "KDE ylim")
         try:
@@ -181,6 +194,8 @@ class App(tk.Tk):
             sample=sample,
             cache_path=cache_path,
             use_duplicate_count=self.use_dup_var.get(),
+            recalculate_pgen=self.recalc_pgen_var.get(),
+            pgen_workers=pgen_workers,
             min_v_align_len=max(0, min_vlen),
             locus="IGH",
             xlim=xlim,

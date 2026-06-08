@@ -9,6 +9,7 @@ Input is an IgBLAST AIRR outfmt 19 TSV, not FASTA.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import io
 import math
@@ -88,6 +89,8 @@ class AnalysisConfig:
     sample: str
     cache_path: Path
     use_duplicate_count: bool = False
+    recalculate_pgen: bool = True
+    pgen_workers: int = 4
     min_v_align_len: int = 0
     locus: str = "IGH"
     xlim: tuple[float, float] = (-30.0, -5.0)
@@ -247,13 +250,10 @@ def load_pgen_cache(cache_path: Path) -> dict[str, float]:
     return cache
 
 
-def compute_pgen_for_aas(aas: Iterable[str], cache_path: Path, log: LogFn) -> dict[str, float]:
-    cache = load_pgen_cache(cache_path)
-    todo = [aa for aa in sorted(set(aas)) if aa not in cache]
-    if not todo:
-        log(f"pGen cache hit: {len(cache):,} entries; no new OLGA calculation.")
-        return cache
+_PGEN_MODEL = None
 
+
+def build_olga_pgen_model():
     try:
         import olga
         import olga.generation_probability as generation_probability
@@ -274,28 +274,113 @@ def compute_pgen_for_aas(aas: Iterable[str], cache_path: Path, log: LogFn) -> di
     )
     gen_model = load_model.GenerativeModelVDJ()
     gen_model.load_and_process_igor_model(str(model_dir / "model_marginals.txt"))
-    pgen_model = generation_probability.GenerationProbabilityVDJ(gen_model, genomic_data)
+    return generation_probability.GenerationProbabilityVDJ(gen_model, genomic_data)
 
+
+def compute_one_pgen(aa: str, pgen_model) -> float:
+    try:
+        return float(pgen_model.compute_aa_CDR3_pgen(aa, print_warnings=False))
+    except TypeError:
+        try:
+            return float(pgen_model.compute_aa_CDR3_pgen(aa))
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
+
+
+def init_pgen_worker() -> None:
+    global _PGEN_MODEL
+    _PGEN_MODEL = build_olga_pgen_model()
+
+
+def compute_pgen_worker(aa: str) -> tuple[str, float]:
+    global _PGEN_MODEL
+    if _PGEN_MODEL is None:
+        _PGEN_MODEL = build_olga_pgen_model()
+    return aa, compute_one_pgen(aa, _PGEN_MODEL)
+
+
+def write_fresh_pgen_cache(cache_path: Path, values: dict[str, float]) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    need_header = not cache_path.exists()
-    with cache_path.open("a", encoding="utf-8", newline="") as handle:
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        if need_header:
-            writer.writerow(["junction_aa", "pgen"])
+        writer.writerow(["junction_aa", "pgen"])
+        for aa in sorted(values):
+            writer.writerow([aa, f"{float(values[aa]):.17g}"])
+    os.replace(tmp_path, cache_path)
+
+
+def compute_pgen_for_aas(
+    aas: Iterable[str],
+    cache_path: Path,
+    log: LogFn,
+    recalculate: bool = True,
+    workers: int = 4,
+) -> dict[str, float]:
+    unique_aas = sorted(set(aas))
+    workers = max(1, int(workers or 1))
+    cache: dict[str, float] = {}
+    if recalculate:
+        todo = unique_aas
+        log(f"pGen cache ignored: recalculating all {len(todo):,} unique junction_aa sequences.")
+        log("A fresh pGen cache will be written after successful pGen calculation.")
+    else:
+        cache = load_pgen_cache(cache_path)
+        todo = [aa for aa in unique_aas if aa not in cache]
+        if not todo:
+            log(f"pGen cache hit: {len(cache):,} entries; no new OLGA calculation.")
+            return cache
+        log(f"pGen cache enabled: {len(cache):,} cached entries; {len(todo):,} new AA sequences to compute.")
+
+    if not todo:
+        return cache
+
+    computed: dict[str, float] = {}
+    if workers <= 1 or len(todo) == 1:
+        pgen_model = build_olga_pgen_model()
         for i, aa in enumerate(todo, start=1):
-            try:
-                pgen = float(pgen_model.compute_aa_CDR3_pgen(aa, print_warnings=False))
-            except TypeError:
-                try:
-                    pgen = float(pgen_model.compute_aa_CDR3_pgen(aa))
-                except Exception:
-                    pgen = 0.0
-            except Exception:
-                pgen = 0.0
-            cache[aa] = pgen
-            writer.writerow([aa, f"{pgen:.17g}"])
+            computed[aa] = compute_one_pgen(aa, pgen_model)
             if i % 100 == 0 or i == len(todo):
                 log(f"pGen computed {i:,}/{len(todo):,} new AA sequences.")
+    else:
+        workers = min(workers, len(todo))
+        log(f"pGen parallel workers: {workers}")
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=init_pgen_worker) as executor:
+                future_to_aa = {executor.submit(compute_pgen_worker, aa): aa for aa in todo}
+                for i, future in enumerate(concurrent.futures.as_completed(future_to_aa), start=1):
+                    aa = future_to_aa[future]
+                    try:
+                        result_aa, pgen = future.result()
+                        computed[result_aa] = float(pgen)
+                    except Exception:
+                        computed[aa] = 0.0
+                    if i % 100 == 0 or i == len(todo):
+                        log(f"pGen computed {i:,}/{len(todo):,} new AA sequences.")
+        except Exception as exc:
+            remaining = [aa for aa in todo if aa not in computed]
+            log(f"Parallel pGen failed ({type(exc).__name__}); falling back to 1 worker for {len(remaining):,} remaining sequences.")
+            pgen_model = build_olga_pgen_model()
+            for i, aa in enumerate(remaining, start=1):
+                computed[aa] = compute_one_pgen(aa, pgen_model)
+                if i % 100 == 0 or i == len(remaining):
+                    log(f"pGen computed {i:,}/{len(remaining):,} fallback AA sequences.")
+
+    cache.update(computed)
+    if recalculate:
+        write_fresh_pgen_cache(cache_path, {aa: cache.get(aa, 0.0) for aa in unique_aas})
+        log(f"Saved fresh pGen cache: {cache_path}")
+    else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        need_header = not cache_path.exists()
+        with cache_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, delimiter="\t")
+            if need_header:
+                writer.writerow(["junction_aa", "pgen"])
+            for aa in sorted(computed):
+                writer.writerow([aa, f"{computed[aa]:.17g}"])
     return cache
 
 
@@ -878,6 +963,8 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Output folder: {config.output_dir}")
     log_both(f"Sample: {config.sample}")
     log_both(f"pGen cache: {config.cache_path}")
+    log_both(f"pGen cache policy: {'recalculate all and refresh cache' if config.recalculate_pgen else 'use existing cache when available'}")
+    log_both(f"pGen workers: {max(1, int(config.pgen_workers))}")
     log_both(f"Locus policy: keep {config.locus}; empty locus is kept with a QC count.")
 
     aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, row_records, stats = read_and_aggregate(
@@ -888,7 +975,13 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Saved QC summary: {outputs['qc_summary']}")
 
     aa_all = sorted(aa_counts.keys())
-    aa_to_pgen = compute_pgen_for_aas(aa_all, config.cache_path, log_both)
+    aa_to_pgen = compute_pgen_for_aas(
+        aa_all,
+        config.cache_path,
+        log_both,
+        recalculate=config.recalculate_pgen,
+        workers=config.pgen_workers,
+    )
     add_pgen_to_row_records(row_records, aa_to_pgen)
 
     frac_unique, frac_weighted = write_pgen_bins(aa_counts, aa_to_pgen, outputs["pgen_bins"])
@@ -961,6 +1054,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", default="", help="Output folder. Default: same folder as input.")
     parser.add_argument("--sample", default="", help="Sample name for plot titles and output prefix.")
     parser.add_argument("--pgen-cache", default="", help="pGen cache TSV. Default: <outdir>/pgen_cache.tsv")
+    parser.add_argument("--use-pgen-cache", action="store_true", help="Use existing pGen cache when available. Default: recalculate all pGen.")
+    parser.add_argument("--pgen-workers", type=int, default=4, help="Parallel OLGA pGen worker processes. Default: 4.")
     parser.add_argument("--use-duplicate-count", action="store_true", help="Use duplicate_count as pGen weighted count if present.")
     parser.add_argument("--min-v-align-len", type=int, default=0, help="Optional V alignment length filter. Default: 0 disabled.")
     parser.add_argument("--locus", default="IGH", help="Expected locus. Default: IGH. Empty disables locus filtering.")
@@ -985,6 +1080,8 @@ def main(argv: list[str] | None = None) -> int:
         sample=sample,
         cache_path=cache_path,
         use_duplicate_count=bool(args.use_duplicate_count),
+        recalculate_pgen=not bool(args.use_pgen_cache),
+        pgen_workers=max(1, int(args.pgen_workers)),
         min_v_align_len=max(0, int(args.min_v_align_len)),
         locus=args.locus.strip(),
         xlim=parse_range(args.xlim, "xlim"),
