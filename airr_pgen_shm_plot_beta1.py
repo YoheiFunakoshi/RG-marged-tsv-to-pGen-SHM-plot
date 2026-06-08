@@ -347,18 +347,19 @@ def compute_pgen_for_aas(
     else:
         workers = min(workers, len(todo))
         log(f"pGen parallel workers: {workers}")
+        executor = None
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=init_pgen_worker) as executor:
-                future_to_aa = {executor.submit(compute_pgen_worker, aa): aa for aa in todo}
-                for i, future in enumerate(concurrent.futures.as_completed(future_to_aa), start=1):
-                    aa = future_to_aa[future]
-                    try:
-                        result_aa, pgen = future.result()
-                        computed[result_aa] = float(pgen)
-                    except Exception:
-                        computed[aa] = 0.0
-                    if i % 100 == 0 or i == len(todo):
-                        log(f"pGen computed {i:,}/{len(todo):,} new AA sequences.")
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=init_pgen_worker)
+            future_to_aa = {executor.submit(compute_pgen_worker, aa): aa for aa in todo}
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_aa), start=1):
+                aa = future_to_aa[future]
+                try:
+                    result_aa, pgen = future.result()
+                    computed[result_aa] = float(pgen)
+                except Exception:
+                    computed[aa] = 0.0
+                if i % 100 == 0 or i == len(todo):
+                    log(f"pGen computed {i:,}/{len(todo):,} new AA sequences.")
         except Exception as exc:
             remaining = [aa for aa in todo if aa not in computed]
             log(f"Parallel pGen failed ({type(exc).__name__}); falling back to 1 worker for {len(remaining):,} remaining sequences.")
@@ -367,6 +368,12 @@ def compute_pgen_for_aas(
                 computed[aa] = compute_one_pgen(aa, pgen_model)
                 if i % 100 == 0 or i == len(remaining):
                     log(f"pGen computed {i:,}/{len(remaining):,} fallback AA sequences.")
+        finally:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
 
     cache.update(computed)
     if recalculate:
