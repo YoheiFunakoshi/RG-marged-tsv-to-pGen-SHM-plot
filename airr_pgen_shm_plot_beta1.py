@@ -90,7 +90,7 @@ class AnalysisConfig:
     cache_path: Path
     use_duplicate_count: bool = False
     recalculate_pgen: bool = True
-    pgen_workers: int = 4
+    pgen_workers: int = 6
     min_v_align_len: int = 0
     locus: str = "IGH"
     xlim: tuple[float, float] = (-30.0, -5.0)
@@ -317,7 +317,7 @@ def compute_pgen_for_aas(
     cache_path: Path,
     log: LogFn,
     recalculate: bool = True,
-    workers: int = 4,
+    workers: int = 6,
 ) -> dict[str, float]:
     unique_aas = sorted(set(aas))
     workers = max(1, int(workers or 1))
@@ -1062,7 +1062,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample", default="", help="Sample name for plot titles and output prefix.")
     parser.add_argument("--pgen-cache", default="", help="pGen cache TSV. Default: <outdir>/pgen_cache.tsv")
     parser.add_argument("--use-pgen-cache", action="store_true", help="Use existing pGen cache when available. Default: recalculate all pGen.")
-    parser.add_argument("--pgen-workers", type=int, default=4, help="Parallel OLGA pGen worker processes. Default: 4.")
+    parser.add_argument("--pgen-workers", type=int, default=6, help="Parallel OLGA pGen worker processes. Default: 6.")
     parser.add_argument("--use-duplicate-count", action="store_true", help="Use duplicate_count as pGen weighted count if present.")
     parser.add_argument("--min-v-align-len", type=int, default=0, help="Optional V alignment length filter. Default: 0 disabled.")
     parser.add_argument("--locus", default="IGH", help="Expected locus. Default: IGH. Empty disables locus filtering.")

@@ -31,7 +31,7 @@ class App(tk.Tk):
         self.cache_var = tk.StringVar()
         self.use_dup_var = tk.BooleanVar(value=False)
         self.recalc_pgen_var = tk.BooleanVar(value=True)
-        self.pgen_workers_var = tk.StringVar(value="4")
+        self.pgen_workers_var = tk.StringVar(value="6")
         self.vlen_var = tk.StringVar(value="0")
         self.xlim_var = tk.StringVar(value="-30,-5")
         self.ylim_var = tk.StringVar(value="0,15")
@@ -175,7 +175,7 @@ class App(tk.Tk):
         except ValueError as exc:
             raise ValueError("Min V alignment length must be an integer.") from exc
         try:
-            pgen_workers = int(self.pgen_workers_var.get().strip() or "4")
+            pgen_workers = int(self.pgen_workers_var.get().strip() or "6")
         except ValueError as exc:
             raise ValueError("pGen workers must be an integer.") from exc
         if pgen_workers < 1:
