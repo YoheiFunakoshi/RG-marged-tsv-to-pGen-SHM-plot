@@ -297,6 +297,7 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
     j_to_shm: dict[str, list[float]] = defaultdict(list)
     j_to_aa: dict[str, Counter] = defaultdict(Counter)
     j_to_read_count = Counter()
+    j_to_weighted_read_count = Counter()
     j_to_vlen: dict[str, list[int]] = defaultdict(list)
 
     for row in open_airr_tsv(config.input_path):
@@ -352,6 +353,7 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
         j_to_shm[junction].append(shm)
         j_to_aa[junction][aa] += 1
         j_to_read_count[junction] += 1
+        j_to_weighted_read_count[junction] += weight
         if vlen:
             j_to_vlen[junction].append(vlen)
         stats["kept_weighted_reads"] += weight
@@ -370,7 +372,7 @@ def read_and_aggregate(config: AnalysisConfig, log: LogFn):
     log(f"Rows kept after beta_1 filtering: {stats['kept_reads']:,}")
     log(f"Unique junction(nt) points: {stats['kept_unique_junction_nt']:,}")
     log(f"Unique junction_aa for pGen: {stats['kept_unique_junction_aa']:,}")
-    return aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_vlen, stats
+    return aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, stats
 
 
 def write_qc_summary(stats: Counter, out_tsv: Path) -> None:
@@ -424,11 +426,14 @@ def write_points(
     j_to_shm: dict[str, list[float]],
     j_to_aa: dict[str, Counter],
     j_to_read_count: Counter,
+    j_to_weighted_read_count: Counter,
     j_to_vlen: dict[str, list[int]],
     aa_to_pgen: dict[str, float],
     out_tsv: Path,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    total_reads = sum(j_to_read_count.values()) or 1
+    total_weighted_reads = sum(j_to_weighted_read_count.values()) or 1
     with out_tsv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow([
@@ -440,6 +445,9 @@ def write_points(
             "log10_pgen",
             "v_seq_len_median",
             "aa_candidate_count",
+            "read_fraction",
+            "weighted_read_count",
+            "weighted_read_fraction",
         ])
         for junction in junctions:
             shm_values = j_to_shm.get(junction, [])
@@ -451,10 +459,15 @@ def write_points(
             log10_pgen = math.log10(pgen) if pgen > 0 else math.nan
             vlen_values = j_to_vlen.get(junction, [])
             vlen_median = int(np.median(vlen_values)) if vlen_values else 0
+            read_count = int(j_to_read_count.get(junction, 0))
+            weighted_read_count = int(j_to_weighted_read_count.get(junction, read_count))
             row = {
                 "junction_nt": junction,
                 "junction_aa": representative_aa,
-                "read_count": int(j_to_read_count.get(junction, 0)),
+                "read_count": read_count,
+                "read_fraction": read_count / total_reads,
+                "weighted_read_count": weighted_read_count,
+                "weighted_read_fraction": weighted_read_count / total_weighted_reads,
                 "shm_median": float(np.median(shm_values)),
                 "pgen": pgen,
                 "log10_pgen": log10_pgen,
@@ -471,25 +484,41 @@ def write_points(
                 "" if math.isnan(log10_pgen) else f"{log10_pgen:.12g}",
                 row["v_seq_len_median"],
                 row["aa_candidate_count"],
+                f"{row['read_fraction']:.12g}",
+                row["weighted_read_count"],
+                f"{row['weighted_read_fraction']:.12g}",
             ])
     return rows
 
 
-def write_shm_hist(points: list[dict[str, object]], out_tsv: Path) -> list[float]:
+def write_shm_hist(points: list[dict[str, object]], out_tsv: Path, weight_key: str | None = None) -> list[float]:
     counts = Counter()
     for row in points:
-        counts[shm_bin_label(float(row["shm_median"]))] += 1
+        weight = float(row.get(weight_key, 1.0)) if weight_key else 1.0
+        counts[shm_bin_label(float(row["shm_median"]))] += weight
     total = sum(counts.values()) or 1
     fractions = [counts.get(label, 0) / total for label in SHM_LABELS]
     with out_tsv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["bin", "count", "fraction"])
+        if weight_key:
+            writer.writerow(["bin", "count_weightedReads", "fraction_weightedReads"])
+        else:
+            writer.writerow(["bin", "count", "fraction"])
         for label, fraction in zip(SHM_LABELS, fractions):
-            writer.writerow([label, counts.get(label, 0), f"{fraction:.12g}"])
+            count_value = counts.get(label, 0)
+            if float(count_value).is_integer():
+                count_value = int(count_value)
+            writer.writerow([label, count_value, f"{fraction:.12g}"])
     return fractions
 
 
-def plot_kde(points: list[dict[str, object]], config: AnalysisConfig, out_png: Path, log: LogFn) -> int:
+def plot_kde(
+    points: list[dict[str, object]],
+    config: AnalysisConfig,
+    out_png: Path,
+    log: LogFn,
+    weight_key: str | None = None,
+) -> int:
     filtered = [
         row
         for row in points
@@ -505,15 +534,29 @@ def plot_kde(points: list[dict[str, object]], config: AnalysisConfig, out_png: P
 
     xs = np.array([float(row["log10_pgen"]) for row in filtered], dtype=float)
     ys = np.array([float(row["shm_median"]) for row in filtered], dtype=float)
+    weights = None
+    if weight_key:
+        weights = np.array([max(0.0, float(row.get(weight_key, 0.0))) for row in filtered], dtype=float)
+        if weights.sum() <= 0:
+            weights = None
     try:
-        kde = gaussian_kde(
-            np.vstack([xs, ys]),
-            bw_method=lambda obj: obj.scotts_factor() * config.bw_factor,
-        )
+        kde_args = {
+            "bw_method": lambda obj: obj.scotts_factor() * config.bw_factor,
+        }
+        if weights is not None:
+            kde_args["weights"] = weights
+        kde = gaussian_kde(np.vstack([xs, ys]), **kde_args)
         xi = np.linspace(config.xlim[0], config.xlim[1], 250)
         yi = np.linspace(config.ylim[0], config.ylim[1], 250)
         x_grid, y_grid = np.meshgrid(xi, yi)
         density = kde(np.vstack([x_grid.ravel(), y_grid.ravel()])).reshape(x_grid.shape)
+    except TypeError as exc:
+        if weights is not None:
+            log(f"Weighted KDE is not supported by this SciPy ({exc}); writing unweighted KDE instead.")
+            return plot_kde(points, config, out_png, log, weight_key=None)
+        log(f"KDE failed ({exc}); writing scatter fallback instead.")
+        plot_scatter(filtered, config, out_png)
+        return len(filtered)
     except Exception as exc:
         log(f"KDE failed ({exc}); writing scatter fallback instead.")
         plot_scatter(filtered, config, out_png)
@@ -523,7 +566,43 @@ def plot_kde(points: list[dict[str, object]], config: AnalysisConfig, out_png: P
     plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
     plt.xlabel("pGen (log10)")
     plt.ylabel("%Mutation")
-    plt.title(f"{config.sample} pGen-SHM KDE")
+    suffix = "weighted KDE" if weight_key else "KDE"
+    plt.title(f"{config.sample} pGen-SHM {suffix}")
+    plt.xlim(config.xlim)
+    plt.ylim(config.ylim)
+    plt.grid(True, alpha=0.35)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+    return len(filtered)
+
+
+def plot_weighted_scatter(points: list[dict[str, object]], config: AnalysisConfig, out_png: Path) -> int:
+    filtered = [
+        row
+        for row in points
+        if float(row["pgen"]) > 0
+        and not math.isnan(float(row["log10_pgen"]))
+        and config.xlim[0] <= float(row["log10_pgen"]) <= config.xlim[1]
+        and config.ylim[0] <= float(row["shm_median"]) <= config.ylim[1]
+    ]
+    xs = np.array([float(row["log10_pgen"]) for row in filtered], dtype=float)
+    ys = np.array([float(row["shm_median"]) for row in filtered], dtype=float)
+    weights = np.array([max(1.0, float(row.get("weighted_read_count", row.get("read_count", 1)))) for row in filtered], dtype=float)
+    if len(filtered) == 0:
+        sizes = np.array([], dtype=float)
+    else:
+        log_weights = np.log10(weights + 1.0)
+        if float(log_weights.max()) > float(log_weights.min()):
+            sizes = 12.0 + 80.0 * (log_weights - log_weights.min()) / (log_weights.max() - log_weights.min())
+        else:
+            sizes = np.full_like(log_weights, 28.0)
+
+    plt.figure(figsize=(6.2, 6.0))
+    plt.scatter(xs, ys, s=sizes, alpha=0.38, color="#2b7fb8", edgecolors="none")
+    plt.xlabel("pGen (log10)")
+    plt.ylabel("%Mutation")
+    plt.title(f"{config.sample} pGen-SHM scatter weighted by reads")
     plt.xlim(config.xlim)
     plt.ylim(config.ylim)
     plt.grid(True, alpha=0.35)
@@ -565,8 +644,12 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
         "pgen_bins_weighted_png": config.output_dir / f"{prefix}_pgen_bins_weighted.png",
         "shm_hist": config.output_dir / f"{prefix}_shm_hist.tsv",
         "shm_hist_png": config.output_dir / f"{prefix}_shm_hist.png",
+        "shm_hist_weighted": config.output_dir / f"{prefix}_shm_hist_weighted.tsv",
+        "shm_hist_weighted_png": config.output_dir / f"{prefix}_shm_hist_weighted.png",
         "points": config.output_dir / f"{prefix}_pgen_shm_points.tsv",
         "kde_png": config.output_dir / f"{prefix}_pgen_shm_kde_unweighted.png",
+        "kde_weighted_png": config.output_dir / f"{prefix}_pgen_shm_kde_weighted.png",
+        "scatter_weighted_png": config.output_dir / f"{prefix}_pgen_shm_scatter_weighted.png",
         "run_log": config.output_dir / f"{prefix}_run_log.txt",
     }
     run_log_lines: list[str] = []
@@ -581,7 +664,7 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"pGen cache: {config.cache_path}")
     log_both(f"Locus policy: keep {config.locus}; empty locus is kept with a QC count.")
 
-    aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_vlen, stats = read_and_aggregate(config, log_both)
+    aa_counts, j_to_shm, j_to_aa, j_to_read_count, j_to_weighted_read_count, j_to_vlen, stats = read_and_aggregate(config, log_both)
     write_qc_summary(stats, outputs["qc_summary"])
     log_both(f"Saved QC summary: {outputs['qc_summary']}")
 
@@ -595,7 +678,16 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Saved pGen bins: {outputs['pgen_bins']}")
     log_both(f"Saved pGen plots: {outputs['pgen_bins_unique_png']} ; {outputs['pgen_bins_weighted_png']}")
 
-    points = write_points(sorted(j_to_read_count.keys()), j_to_shm, j_to_aa, j_to_read_count, j_to_vlen, aa_to_pgen, outputs["points"])
+    points = write_points(
+        sorted(j_to_read_count.keys()),
+        j_to_shm,
+        j_to_aa,
+        j_to_read_count,
+        j_to_weighted_read_count,
+        j_to_vlen,
+        aa_to_pgen,
+        outputs["points"],
+    )
     zero_points = sum(1 for row in points if float(row["pgen"]) <= 0)
     log_both(f"Saved pGen-SHM points: {outputs['points']}")
     log_both(f"pGen=0 points retained in points TSV and excluded from KDE: {zero_points:,}")
@@ -604,9 +696,28 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     plot_barh(SHM_LABELS, shm_frac, "%Mutation", "Frequency", f"{config.sample} SHM histogram", outputs["shm_hist_png"])
     log_both(f"Saved SHM histogram: {outputs['shm_hist']} ; {outputs['shm_hist_png']}")
 
+    shm_weighted_frac = write_shm_hist(points, outputs["shm_hist_weighted"], weight_key="weighted_read_count")
+    plot_barh(
+        SHM_LABELS,
+        shm_weighted_frac,
+        "%Mutation",
+        "Frequency",
+        f"{config.sample} SHM histogram (weighted by reads)",
+        outputs["shm_hist_weighted_png"],
+    )
+    log_both(f"Saved weighted SHM histogram: {outputs['shm_hist_weighted']} ; {outputs['shm_hist_weighted_png']}")
+
     kde_points = plot_kde(points, config, outputs["kde_png"], log_both)
     log_both(f"Saved pGen-SHM KDE plot: {outputs['kde_png']}")
     log_both(f"KDE plotted points: {kde_points:,}")
+
+    weighted_kde_points = plot_kde(points, config, outputs["kde_weighted_png"], log_both, weight_key="weighted_read_count")
+    log_both(f"Saved weighted pGen-SHM KDE plot: {outputs['kde_weighted_png']}")
+    log_both(f"Weighted KDE plotted points: {weighted_kde_points:,}")
+
+    scatter_points = plot_weighted_scatter(points, config, outputs["scatter_weighted_png"])
+    log_both(f"Saved weighted pGen-SHM scatter plot: {outputs['scatter_weighted_png']}")
+    log_both(f"Weighted scatter plotted points: {scatter_points:,}")
 
     write_run_log(run_log_lines, outputs["run_log"])
     log(f"Saved run log: {outputs['run_log']}")

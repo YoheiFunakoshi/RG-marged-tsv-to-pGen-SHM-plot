@@ -66,7 +66,7 @@ class App(tk.Tk):
         opts.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         opts.columnconfigure(1, weight=1)
         opts.columnconfigure(3, weight=1)
-        tk.Checkbutton(opts, text="Use duplicate_count as pGen weighted count if present", variable=self.use_dup_var).grid(
+        tk.Checkbutton(opts, text="Use duplicate_count for weighted outputs if present", variable=self.use_dup_var).grid(
             row=0, column=0, columnspan=4, sticky="w"
         )
         tk.Label(opts, text="Min V alignment length").grid(row=1, column=0, sticky="w", pady=(6, 0))
