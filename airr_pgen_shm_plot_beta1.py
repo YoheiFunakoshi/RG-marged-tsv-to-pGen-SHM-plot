@@ -28,6 +28,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from scipy.stats import gaussian_kde
 
 try:
@@ -59,6 +60,56 @@ SHM_LABELS = [
     "16~18%",
     "18~20%",
     "20~%",
+]
+ROI_DEFINITIONS = [
+    {
+        "name": "beta1_low_shm_high_pgen",
+        "condition": "-16 < log10_pgen < -9 and 0 <= SHM < 2",
+        "x_min": -16.0,
+        "x_max": -9.0,
+        "x_min_inclusive": False,
+        "x_max_inclusive": False,
+        "y_min": 0.0,
+        "y_max": 2.0,
+        "y_min_inclusive": True,
+        "y_max_inclusive": False,
+    },
+    {
+        "name": "low_shm_core",
+        "condition": "-15 <= log10_pgen < -10 and 0 <= SHM < 2",
+        "x_min": -15.0,
+        "x_max": -10.0,
+        "x_min_inclusive": True,
+        "x_max_inclusive": False,
+        "y_min": 0.0,
+        "y_max": 2.0,
+        "y_min_inclusive": True,
+        "y_max_inclusive": False,
+    },
+    {
+        "name": "low_shm_broad",
+        "condition": "-16 <= log10_pgen < -5 and 0 <= SHM < 3",
+        "x_min": -16.0,
+        "x_max": -5.0,
+        "x_min_inclusive": True,
+        "x_max_inclusive": False,
+        "y_min": 0.0,
+        "y_max": 3.0,
+        "y_min_inclusive": True,
+        "y_max_inclusive": False,
+    },
+    {
+        "name": "main_mid_high_shm_reference",
+        "condition": "-21 <= log10_pgen < -10 and 5 <= SHM < 15",
+        "x_min": -21.0,
+        "x_max": -10.0,
+        "x_min_inclusive": True,
+        "x_max_inclusive": False,
+        "y_min": 5.0,
+        "y_max": 15.0,
+        "y_min_inclusive": True,
+        "y_max_inclusive": False,
+    },
 ]
 ROW_LEVEL_COLUMNS = [
     "sequence_id",
@@ -626,6 +677,162 @@ def write_points(
     return rows
 
 
+def in_range(value: float, left: float, right: float, left_inclusive: bool, right_inclusive: bool) -> bool:
+    left_ok = value >= left if left_inclusive else value > left
+    right_ok = value <= right if right_inclusive else value < right
+    return left_ok and right_ok
+
+
+def valid_log10_pgen(value: object) -> bool:
+    try:
+        numeric = float(value)
+    except Exception:
+        return False
+    return not math.isnan(numeric) and math.isfinite(numeric)
+
+
+def median_or_blank(values: list[float]) -> str:
+    if not values:
+        return ""
+    return f"{float(np.median(values)):.12g}"
+
+
+def min_or_blank(values: list[float]) -> str:
+    if not values:
+        return ""
+    return f"{float(min(values)):.12g}"
+
+
+def max_or_blank(values: list[float]) -> str:
+    if not values:
+        return ""
+    return f"{float(max(values)):.12g}"
+
+
+def summarize_roi_rows(
+    rows: list[dict[str, object]],
+    roi: dict[str, object],
+    *,
+    view: str,
+    y_key: str,
+    junction_key: str,
+    point_weight_key: str,
+    read_count_key: str | None,
+    weighted_read_count_key: str | None,
+    valid_denominator: int,
+) -> list[object]:
+    selected: list[dict[str, object]] = []
+    for row in rows:
+        if float(row.get("pgen", 0.0)) <= 0 or not valid_log10_pgen(row.get("log10_pgen")):
+            continue
+        x = float(row["log10_pgen"])
+        y = float(row[y_key])
+        if (
+            in_range(
+                x,
+                float(roi["x_min"]),
+                float(roi["x_max"]),
+                bool(roi["x_min_inclusive"]),
+                bool(roi["x_max_inclusive"]),
+            )
+            and in_range(
+                y,
+                float(roi["y_min"]),
+                float(roi["y_max"]),
+                bool(roi["y_min_inclusive"]),
+                bool(roi["y_max_inclusive"]),
+            )
+        ):
+            selected.append(row)
+
+    xs = [float(row["log10_pgen"]) for row in selected]
+    ys = [float(row[y_key]) for row in selected]
+    point_count = len(selected)
+    fraction = point_count / valid_denominator if valid_denominator else 0.0
+    if read_count_key:
+        read_count_sum = sum(float(row.get(read_count_key, 0.0)) for row in selected)
+    else:
+        read_count_sum = sum(float(row.get(point_weight_key, 1.0)) for row in selected)
+    if weighted_read_count_key:
+        weighted_read_count_sum = sum(float(row.get(weighted_read_count_key, 0.0)) for row in selected)
+    else:
+        weighted_read_count_sum = sum(float(row.get(point_weight_key, 1.0)) for row in selected)
+    unique_junctions = len({str(row.get(junction_key, "")) for row in selected if str(row.get(junction_key, ""))})
+    unique_aas = len({str(row.get("junction_aa", "")) for row in selected if str(row.get("junction_aa", ""))})
+    unique_xy = len({(float(row["log10_pgen"]), float(row[y_key])) for row in selected})
+
+    return [
+        view,
+        roi["name"],
+        roi["condition"],
+        point_count,
+        f"{fraction:.12g}",
+        f"{read_count_sum:.12g}",
+        f"{weighted_read_count_sum:.12g}",
+        unique_junctions,
+        unique_aas,
+        unique_xy,
+        median_or_blank(xs),
+        median_or_blank(ys),
+        min_or_blank(xs),
+        max_or_blank(xs),
+        min_or_blank(ys),
+        max_or_blank(ys),
+    ]
+
+
+def write_roi_summary(row_records: list[dict[str, object]], beta1_points: list[dict[str, object]], out_tsv: Path) -> None:
+    row_valid = [row for row in row_records if float(row.get("pgen", 0.0)) > 0 and valid_log10_pgen(row.get("log10_pgen"))]
+    beta_valid = [row for row in beta1_points if float(row.get("pgen", 0.0)) > 0 and valid_log10_pgen(row.get("log10_pgen"))]
+    with out_tsv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow([
+            "view",
+            "roi_name",
+            "condition",
+            "point_count",
+            "fraction_of_valid_points",
+            "read_count_sum",
+            "weighted_read_count_sum",
+            "unique_junction_nt",
+            "unique_junction_aa",
+            "unique_xy",
+            "log10_pgen_median",
+            "shm_median",
+            "log10_pgen_min_observed",
+            "log10_pgen_max_observed",
+            "shm_min_observed",
+            "shm_max_observed",
+        ])
+        for roi in ROI_DEFINITIONS:
+            writer.writerow(
+                summarize_roi_rows(
+                    row_valid,
+                    roi,
+                    view="row_level_sequence_id",
+                    y_key="shm",
+                    junction_key="junction",
+                    point_weight_key="plot_weight",
+                    read_count_key=None,
+                    weighted_read_count_key=None,
+                    valid_denominator=len(row_valid),
+                )
+            )
+            writer.writerow(
+                summarize_roi_rows(
+                    beta_valid,
+                    roi,
+                    view="beta1_unique_junction_median",
+                    y_key="shm_median",
+                    junction_key="junction_nt",
+                    point_weight_key="read_count",
+                    read_count_key="read_count",
+                    weighted_read_count_key="weighted_read_count",
+                    valid_denominator=len(beta_valid),
+                )
+            )
+
+
 def add_pgen_to_row_records(row_records: list[dict[str, object]], aa_to_pgen: dict[str, float]) -> None:
     xy_counts = Counter()
     for row in row_records:
@@ -741,6 +948,7 @@ def plot_kde(
     out_png: Path,
     log: LogFn,
     weight_key: str | None = None,
+    title_suffix: str | None = None,
 ) -> int:
     filtered = [
         row
@@ -776,7 +984,7 @@ def plot_kde(
     except TypeError as exc:
         if weights is not None:
             log(f"Weighted KDE is not supported by this SciPy ({exc}); writing unweighted KDE instead.")
-            return plot_kde(points, config, out_png, log, weight_key=None)
+            return plot_kde(points, config, out_png, log, weight_key=None, title_suffix=title_suffix)
         log(f"KDE failed ({exc}); writing scatter fallback instead.")
         plot_scatter(filtered, config, out_png)
         return len(filtered)
@@ -789,7 +997,7 @@ def plot_kde(
     plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
     plt.xlabel("pGen (log10)")
     plt.ylabel("%Mutation")
-    suffix = "weighted KDE" if weight_key else "KDE"
+    suffix = title_suffix or ("weighted KDE" if weight_key else "KDE")
     plt.title(f"{config.sample} pGen-SHM {suffix}")
     plt.xlim(config.xlim)
     plt.ylim(config.ylim)
@@ -841,6 +1049,7 @@ def plot_xy_kde(
     out_png: Path,
     log: LogFn,
     title_suffix: str,
+    log_density: bool = False,
 ) -> int:
     if len(xy_points) < 5:
         log("Too few valid row-level points for KDE; writing scatter fallback instead.")
@@ -873,7 +1082,28 @@ def plot_xy_kde(
         return int(sum(point.get("plot_weight", 1.0) for point in xy_points))
 
     plt.figure(figsize=(6.2, 6.0))
-    plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
+    if log_density:
+        positive_density = density[density > 0]
+        if positive_density.size and float(density.max()) > 0:
+            density_max = float(density.max())
+            density_min = max(float(np.percentile(positive_density, 1)), density_max * 0.005)
+            if density_min < density_max:
+                levels = np.geomspace(density_min, density_max, 12)
+                plt.contourf(
+                    x_grid,
+                    y_grid,
+                    density,
+                    levels=levels,
+                    cmap="YlOrRd",
+                    norm=LogNorm(vmin=density_min, vmax=density_max),
+                    extend="min",
+                )
+            else:
+                plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
+        else:
+            plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
+    else:
+        plt.contourf(x_grid, y_grid, density, levels=12, cmap="YlOrRd")
     plt.xlabel("pGen (log10)")
     plt.ylabel("%Mutation")
     plt.title(f"{config.sample} pGen-SHM {title_suffix}")
@@ -954,8 +1184,14 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
         "shm_hist_weighted_png": config.output_dir / f"{prefix}_shm_hist_weighted.png",
         "rows_xlsx": config.output_dir / f"{prefix}_pgen_shm_rows.xlsx",
         "points": config.output_dir / f"{prefix}_pgen_shm_points.tsv",
+        "beta1_points": config.output_dir / f"{prefix}_pgen_shm_beta1_unique_junction_points.tsv",
+        "roi_summary": config.output_dir / f"{prefix}_pgen_shm_roi_summary.tsv",
         "kde_png": config.output_dir / f"{prefix}_pgen_shm_kde_unweighted.png",
+        "kde_log_density_png": config.output_dir / f"{prefix}_pgen_shm_kde_log_density.png",
         "kde_weighted_png": config.output_dir / f"{prefix}_pgen_shm_kde_weighted.png",
+        "kde_weighted_log_density_png": config.output_dir / f"{prefix}_pgen_shm_kde_weighted_log_density.png",
+        "beta1_kde_png": config.output_dir / f"{prefix}_pgen_shm_kde_beta1_unique_junction_unweighted.png",
+        "beta1_kde_weighted_png": config.output_dir / f"{prefix}_pgen_shm_kde_beta1_unique_junction_weighted.png",
         "scatter_reads_png": config.output_dir / f"{prefix}_pgen_shm_scatter_reads.png",
         "scatter_weighted_png": config.output_dir / f"{prefix}_pgen_shm_scatter_weighted.png",
         "run_log": config.output_dir / f"{prefix}_run_log.txt",
@@ -990,6 +1226,17 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
         workers=config.pgen_workers,
     )
     add_pgen_to_row_records(row_records, aa_to_pgen)
+    beta1_points = write_points(
+        sorted(j_to_read_count.keys()),
+        j_to_shm,
+        j_to_aa,
+        j_to_read_count,
+        j_to_weighted_read_count,
+        j_to_vlen,
+        aa_to_pgen,
+        outputs["beta1_points"],
+    )
+    log_both(f"Saved beta1-compatible unique junction pGen-SHM points TSV: {outputs['beta1_points']}")
 
     frac_unique, frac_weighted = write_pgen_bins(aa_counts, aa_to_pgen, outputs["pgen_bins"])
     plot_barh(PGEN_LABELS, frac_unique, "pGen", "Frequency", f"{config.sample} pGen bins (unique AA)", outputs["pgen_bins_unique_png"])
@@ -1006,6 +1253,9 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Saved row-level pGen-SHM points TSV: {outputs['points']}")
     log_both(f"pGen=0 rows retained in Excel/points TSV and excluded from plots: {zero_points:,}")
     log_both(f"Row-level plot rows: {len(row_records):,}; unique plotted x-y coordinates: {unique_xy_points:,}; rows sharing an x-y coordinate: {duplicate_xy_rows:,}")
+
+    write_roi_summary(row_records, beta1_points, outputs["roi_summary"])
+    log_both(f"Saved pGen-SHM ROI summary: {outputs['roi_summary']}")
 
     shm_frac = write_shm_hist(row_records, outputs["shm_hist"], shm_key="shm")
     plot_barh(SHM_LABELS, shm_frac, "%Mutation", "Frequency", f"{config.sample} SHM histogram", outputs["shm_hist_png"])
@@ -1032,13 +1282,57 @@ def run_analysis(config: AnalysisConfig, log: LogFn = log_default) -> dict[str, 
     log_both(f"Saved row-level pGen-SHM KDE plot: {outputs['kde_png']}")
     log_both(f"Row-level KDE plotted rows: {kde_points:,}")
 
+    kde_log_density_points = plot_xy_kde(
+        xy_points,
+        config,
+        outputs["kde_log_density_png"],
+        log_both,
+        "row-level log-density KDE",
+        log_density=True,
+    )
+    log_both(f"Saved row-level pGen-SHM log-density KDE plot: {outputs['kde_log_density_png']}")
+    log_both(f"Row-level log-density KDE plotted rows: {kde_log_density_points:,}")
+
     weighted_kde_points = plot_xy_kde(weighted_xy_points, config, outputs["kde_weighted_png"], log_both, "row-level weighted KDE")
     log_both(f"Saved row-level weighted pGen-SHM KDE plot: {outputs['kde_weighted_png']}")
     log_both(f"Row-level weighted KDE plotted weight: {weighted_kde_points:,}")
 
+    weighted_kde_log_density_points = plot_xy_kde(
+        weighted_xy_points,
+        config,
+        outputs["kde_weighted_log_density_png"],
+        log_both,
+        "row-level weighted log-density KDE",
+        log_density=True,
+    )
+    log_both(f"Saved row-level weighted pGen-SHM log-density KDE plot: {outputs['kde_weighted_log_density_png']}")
+    log_both(f"Row-level weighted log-density KDE plotted weight: {weighted_kde_log_density_points:,}")
+
     scatter_points = plot_xy_scatter(weighted_xy_points, config, outputs["scatter_weighted_png"], "row-level weighted scatter")
     log_both(f"Saved weighted pGen-SHM scatter plot: {outputs['scatter_weighted_png']}")
     log_both(f"Weighted scatter plotted weight: {scatter_points:,}; plotted x-y coordinates: {len(weighted_xy_points):,}")
+
+    beta1_kde_points = plot_kde(
+        beta1_points,
+        config,
+        outputs["beta1_kde_png"],
+        log_both,
+        weight_key=None,
+        title_suffix="beta1 unique-junction unweighted KDE",
+    )
+    log_both(f"Saved beta1-compatible unique junction unweighted KDE plot: {outputs['beta1_kde_png']}")
+    log_both(f"Beta1-compatible unweighted KDE plotted points: {beta1_kde_points:,}")
+
+    beta1_weighted_kde_points = plot_kde(
+        beta1_points,
+        config,
+        outputs["beta1_kde_weighted_png"],
+        log_both,
+        weight_key="read_count",
+        title_suffix="beta1 unique-junction read-weighted KDE",
+    )
+    log_both(f"Saved beta1-compatible unique junction read-weighted KDE plot: {outputs['beta1_kde_weighted_png']}")
+    log_both(f"Beta1-compatible read-weighted KDE plotted points: {beta1_weighted_kde_points:,}")
 
     write_run_log(run_log_lines, outputs["run_log"])
     log(f"Saved run log: {outputs['run_log']}")
