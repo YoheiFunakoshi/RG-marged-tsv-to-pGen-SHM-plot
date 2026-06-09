@@ -43,13 +43,13 @@ Beta1互換出力は、旧解析・前任者法との比較のために残して
 
 ## Word仕様書
 
-処理単位ごとの詳細仕様は、以下のWord文書に分けています。GitHub上では `.docx` の本文が直接プレビューされないことがあるため、以下のリンクからWordファイルをダウンロードし、Microsoft Wordなどで開いてください。
+処理単位ごとの詳細仕様は、以下のWord文書に分けています。このリポジトリはpublicなので、URLを共有された人もダウンロードできます。GitHub上では `.docx` の本文が直接プレビューされないことがあるため、以下のリンクからWordファイルをダウンロードし、Microsoft Wordなどで開いてください。
 
-- [pGen-SHM仕様書をダウンロード](./TSVからpGen-SHMデータ作成仕様書_20260607.docx?raw=1): 全体フロー、採用フィルタ、row-level Excel/TSV、pGen-SHM plot、議論点。
-- [pGen仕様書をダウンロード](./TSVからpGenデータ作成仕様書_20260607.docx?raw=1): OLGA human_B_heavyによるpGen計算、cache、pGen=0、pGen bins。
-- [SHM仕様書をダウンロード](./TSVからSHMデータ作成仕様書_20260607.docx?raw=1): v_identityからのSHM計算、V alignment length、SHM histogram。
+- [pGen-SHM仕様書をダウンロード](https://raw.githubusercontent.com/YoheiFunakoshi/RG-marged-tsv-to-pGen-SHM-plot/main/docs/pgen_shm_spec_20260607.docx): 全体フロー、採用フィルタ、row-level Excel/TSV、pGen-SHM plot、議論点。
+- [pGen仕様書をダウンロード](https://raw.githubusercontent.com/YoheiFunakoshi/RG-marged-tsv-to-pGen-SHM-plot/main/docs/pgen_spec_20260607.docx): OLGA human_B_heavyによるpGen計算、cache、pGen=0、pGen bins。
+- [SHM仕様書をダウンロード](https://raw.githubusercontent.com/YoheiFunakoshi/RG-marged-tsv-to-pGen-SHM-plot/main/docs/shm_spec_20260607.docx): v_identityからのSHM計算、V alignment length、SHM histogram。
 
-リンク先でGitHubのファイルページが表示された場合は、画面右上の `Download raw file` または `Raw` からダウンロードしてください。
+同じ内容の日本語ファイル名版もリポジトリ直下に残していますが、ブラウザ互換性のため、共有時は上記の英数字ファイル名リンクを使ってください。
 
 ## 最小限の解析概要
 
